@@ -1,17 +1,47 @@
 #!/usr/bin/env python3
+import sys
+import asyncio
+import warnings
+import os
+import json
+import shutil
+from pathlib import Path
+from typing import Dict, Any
+
+# Comprehensive warning suppression - only show print statements
+warnings.filterwarnings("ignore")
+warnings.simplefilter("ignore")
+os.environ["PYTHONWARNINGS"] = "ignore"
+
+# Suppress specific library warnings
+import logging
+logging.captureWarnings(True)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=PendingDeprecationWarning)
+
+# Ensure output is flushed immediately (for PyInstaller builds)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except (AttributeError, ValueError):
+    # Fallback for older Python versions or when reconfigure isn't available
+    import io
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, line_buffering=True)
+    if isinstance(sys.stderr, io.TextIOWrapper):
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, line_buffering=True)
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from langchain_mcp_m2m import MCPClientCredentials
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import HumanMessage
 from langchain_anthropic import ChatAnthropic
-import sys
-import json
-import os
-import shutil
-import argparse
-from pathlib import Path
-from typing import Dict, Any
 from dotenv import load_dotenv
 
+# Load .env file - from bundle when frozen, otherwise current directory
 def extract_bundled_files():
     """Extract bundled data.json to exe directory if needed."""
     if not getattr(sys, 'frozen', False):
@@ -133,45 +163,107 @@ async def process_query(query: str, client_id: str, client_secret: str) -> str:
         return str(last_message)
 
 
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(description='Locus MCP Agent')
-    parser.add_argument('command', choices=['run'], help='Command to execute')
-    parser.add_argument('query', nargs='+', help='Query to process')
-
-    args = parser.parse_args()
-
-    if args.command != 'run':
-        print('❌ Error: Invalid command')
-        print('Usage: python index.py run "<your query>"')
-        sys.exit(1)
-
-    query = ' '.join(args.query)
+def run_query(query: str):
+    """Run the Locus MCP agent with a query."""
     if not query:
-        print('❌ Error: Query parameter is required')
-        print('Usage: python index.py run "<your query>"')
-        sys.exit(1)
-
+        print("Error: Query is required")
+        sys.stdout.flush()
+        return None
+    
     try:
         # Load credentials from data.json
         credentials = load_credentials()
-
+        
         # Process the query
-        import asyncio
         response = asyncio.run(process_query(
             query,
             credentials['client_id'],
             credentials['client_secret']
         ))
-
-        print(response)
-    except Exception as error:
+        
+        return response
+    except Exception as e:
+        print(f"Error in run_query: {e}", file=sys.stderr)
         import traceback
-        print(f'❌ Error: {error}')
-        print('\nFull traceback:')
         traceback.print_exc()
-        sys.exit(1)
+        return None
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
 
 
-if __name__ == '__main__':
-    main()
+# Initialize Flask app
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
+
+# Get port from data.json or use default
+def get_port() -> int:
+    """Get port from data.json or return default."""
+    try:
+        data_path = get_data_path()
+        if os.path.exists(data_path):
+            with open(data_path, 'r', encoding='utf-8') as f:
+                data: Dict[str, Any] = json.load(f)
+                port = data.get('editable', {}).get('port', {}).get('value')
+                if port:
+                    return int(port)
+    except Exception:
+        pass
+    return 8911  # Default port
+
+
+PORT = get_port()
+
+
+@app.route('/run', methods=['POST'])
+def run_endpoint():
+    """Endpoint to run the Locus MCP agent with a query."""
+    try:
+        data = request.get_json() or {}
+        query = data.get('query', '')
+        
+        if not query:
+            return jsonify({"status": "error", "message": "Query parameter is required"}), 400
+        
+        result = run_query(query)
+        if result is None:
+            return jsonify({"status": "error", "message": "Failed to process query"}), 500
+        
+        return jsonify({"status": "success", "result": result}), 200
+    except Exception as e:
+        print(f"Error in run_endpoint: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.stderr.flush()
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/health', methods=['GET'])
+def health_endpoint():
+    """Health check endpoint."""
+    try:
+        # Try to load credentials to verify configuration
+        credentials = load_credentials()
+        return jsonify({
+            "status": "healthy",
+            "configured": True,
+            "port": PORT
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy",
+            "configured": False,
+            "error": str(e),
+            "port": PORT
+        }), 200  # Still return 200 but indicate unhealthy status
+
+
+if __name__ == "__main__":
+    # Start Flask server
+    print("Starting Flask server...")
+    print("Endpoints available:")
+    print("  POST /run - Process query (requires 'query' parameter in JSON body)")
+    print("  GET /health - Health check")
+    print(f"  Server running on port {PORT}")
+    sys.stdout.flush()
+    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
